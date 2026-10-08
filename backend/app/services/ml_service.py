@@ -1,6 +1,10 @@
-import math
-import numpy as np
-from typing import Dict, Any
+import os
+import joblib
+import pandas as pd
+
+# Load models at startup
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../'))
+MODEL_DIR = os.path.join(ROOT_DIR, 'ml', 'models')
 
 # Known major freight route distances (km)
 ROUTE_DISTANCES = {
@@ -13,17 +17,21 @@ ROUTE_DISTANCES = {
     ("salem", "coimbatore"): 165.0,
     ("coimbatore", "salem"): 165.0,
 }
-
 DEFAULT_DISTANCE_KM = 220.0
 
 class MLService:
-    """
-    Developer 3 ML Service:
-    Predicts:
-    1. Transportation Cost (INR)
-    2. Delivery ETA (Hours)
-    3. Vehicle & Provider Suitability Score (0 - 100)
-    """
+    def __init__(self):
+        try:
+            self.cost_model = joblib.load(os.path.join(MODEL_DIR, 'cost_model.pkl'))
+            self.eta_model = joblib.load(os.path.join(MODEL_DIR, 'eta_model.pkl'))
+            self.suitability_model = joblib.load(os.path.join(MODEL_DIR, 'suitability_model.pkl'))
+            self.priority_encoder = joblib.load(os.path.join(MODEL_DIR, 'priority_encoder.pkl'))
+        except Exception as e:
+            print(f"Warning: Could not load ML models, using fallback logic. {e}")
+            self.cost_model = None
+            self.eta_model = None
+            self.suitability_model = None
+            self.priority_encoder = None
 
     def get_route_distance(self, origin: str, destination: str) -> float:
         o = origin.strip().lower()
@@ -38,84 +46,65 @@ class MLService:
         is_ev: bool = False,
         fuel_price_factor: float = 1.05
     ) -> float:
-        """
-        ML Cost Prediction Model:
-        Features: distance, cargo weight, provider base rate, vehicle powertrain, fuel/toll surcharge.
-        """
-        # Weight loading factor (nonlinear scaling for heavy vs LCV)
-        weight_factor = 1.0 + (cargo_weight_kg / 1000.0) * 0.15
-        
-        # Base mileage cost
-        base_cost = distance_km * base_rate_per_km * weight_factor * fuel_price_factor
-        
-        # EV cost benefit: 12% lower operating cost per km
-        if is_ev:
-            base_cost *= 0.88
-            
-        # Commercial toll, driver allowance, and handling overhead
-        overhead = 350.0 + (distance_km * 0.75)
-        
-        total_cost = round(base_cost + overhead, 2)
-        return total_cost
+        if not self.cost_model:
+            # Fallback
+            weight_factor = 1.0 + (cargo_weight_kg / 1000.0) * 0.15
+            return distance_km * base_rate_per_km * weight_factor
+
+        # ML Features: ['distance_km', 'cargo_weight_kg', 'vehicle_efficiency', 'fuel_or_energy_cost', 'traffic_factor', 'weather_factor', 'vehicle_capacity_kg', 'delivery_priority_encoded']
+        features = pd.DataFrame([{
+            'distance_km': distance_km,
+            'cargo_weight_kg': cargo_weight_kg,
+            'vehicle_efficiency': 6.0 if is_ev else 12.0,
+            'fuel_or_energy_cost': 12.0 if is_ev else 95.0,
+            'traffic_factor': 1.1,
+            'weather_factor': 1.0,
+            'vehicle_capacity_kg': max(1000, cargo_weight_kg * 1.5),
+            'delivery_priority_encoded': 0 # Normal
+        }])
+        cost = self.cost_model.predict(features)[0]
+        return round(float(cost), 2)
 
     def predict_eta(
         self,
         distance_km: float,
         is_ev: bool = False,
-        cargo_weight_kg: float = 200.0,
-        traffic_factor: float = 1.1
+        cargo_weight_kg: float = 1000.0
     ) -> float:
-        """
-        ML ETA Prediction Model:
-        Predicts transit time in hours based on highway corridor, traffic, speed profile.
-        Average freight speed on NH44 (Salem-Bangalore corridor) is ~45-50 km/h.
-        """
-        avg_speed_kmh = 48.0
-        if is_ev:
-            # Accounts for fast commercial DC-charging stop if distance > 180 km
-            charge_overhead_hours = 0.4 if distance_km > 180 else 0.0
-            transit_hours = (distance_km / 46.0) * traffic_factor + charge_overhead_hours
-        else:
-            transit_hours = (distance_km / avg_speed_kmh) * traffic_factor
-            
-        # Loading/unloading buffer
-        buffer_hours = 0.5 + (cargo_weight_kg / 2000.0) * 0.2
-        total_eta = round(transit_hours + buffer_hours, 1)
-        return max(total_eta, 1.5)
+        if not self.eta_model:
+            return round(distance_km / 50.0 + 1.0, 2)
+
+        # Features: ['distance_km', 'traffic_factor', 'weather_factor', 'cargo_weight_kg', 'vehicle_capacity_kg']
+        features = pd.DataFrame([{
+            'distance_km': distance_km,
+            'traffic_factor': 1.1,
+            'weather_factor': 1.0,
+            'cargo_weight_kg': cargo_weight_kg,
+            'vehicle_capacity_kg': max(1000, cargo_weight_kg * 1.5)
+        }])
+        eta = self.eta_model.predict(features)[0]
+        return round(float(eta), 2)
 
     def predict_suitability(
         self,
         cargo_weight_kg: float,
         provider_capacity_kg: float,
-        is_ev: bool,
-        distance_km: float,
-        cargo_type: str = "General Merchandise"
+        is_ev: bool = False,
+        distance_km: float = 200.0,
+        cargo_type: str = "general"
     ) -> float:
-        """
-        ML Suitability Prediction Model:
-        Evaluates capacity utilization ratio, powertrain range feasibility, and cargo fit.
-        """
-        if cargo_weight_kg > provider_capacity_kg:
-            return 10.0 # Over capacity penalty
-            
-        utilization = cargo_weight_kg / max(provider_capacity_kg, 1.0)
-        
-        # Ideal utilization for LCV freight is 20% - 85%
-        if 0.15 <= utilization <= 0.85:
-            capacity_score = 95.0
-        elif utilization < 0.15:
-            capacity_score = 75.0 # Under-utilized larger truck
-        else:
-            capacity_score = 85.0 # High load
-            
-        # Route range feasibility
-        range_score = 90.0
-        if is_ev and distance_km > 300:
-            range_score = 70.0 # EV long distance range risk
-        elif is_ev and distance_km <= 250:
-            range_score = 98.0 # EV ideal corridor
-            
-        suitability = (capacity_score * 0.6) + (range_score * 0.4)
-        return round(suitability, 1)
+        if not self.suitability_model:
+            return 100.0 if cargo_weight_kg <= provider_capacity_kg else 0.0
+
+        # Features: ['cargo_weight_kg', 'vehicle_capacity_kg', 'vehicle_age_years', 'vehicle_efficiency']
+        features = pd.DataFrame([{
+            'cargo_weight_kg': cargo_weight_kg,
+            'vehicle_capacity_kg': provider_capacity_kg,
+            'vehicle_age_years': 4,
+            'vehicle_efficiency': 6.0 if is_ev else 12.0
+        }])
+        suit = self.suitability_model.predict(features)[0]
+        # Return 0 to 100
+        return 100.0 if suit == 1 else 0.0
 
 ml_service = MLService()
